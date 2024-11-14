@@ -11,9 +11,10 @@
 #include "Engine/CollisionProfile.h"
 #include "Math/UnrealMathUtility.h"
 
+// Sets default values
 AClothMesh::AClothMesh()
 {
-    PrimaryActorTick.bCanEverTick = true; 
+    PrimaryActorTick.bCanEverTick = true;
 
     // Initialize the Procedural Mesh Component
     ClothMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("ClothMesh"));
@@ -32,22 +33,36 @@ AClothMesh::AClothMesh()
     ClothWidth = 30;
     ClothHeight = 30;
     ClothSpacing = 20.0f;
-    NumberOfHooks = 6; // Default number of hooks
-    GravityStrength = -980.0f; // Corrected to downward direction
-    WindStrength = 0.0f;
-    WindDirection = FVector(1, 0, 0);
+    NumberOfHooks = 6; // Ensure this is even
+    if (NumberOfHooks % 2 != 0)
+    {
+        NumberOfHooks += 1; // Make it even if it's odd
+    }
+    GravityStrength = -980.0f;
+    WindStrength = 900;
+    WindDirection = FVector(1, 0, 0); // Wind blowing along the X-axis
     Damping = 0.99f;
-    SelfCollisionRadius = 10.0f;
-    SelfCollisionStiffness = 0.5f;
+    SelfCollisionRadius = 15.0f;
+    SelfCollisionStiffness = 0.7f;
     TearThreshold = 1.5f;
     bTearingEnabled = false;
 
-    // Initialize curtain movement variables
+    MinHookSpacing = 50.0f;
+
+    // Initialize curtain variables
+    bMovingLeft = false;
+    bMovingRight = false;
     bIsOpening = false;
     bIsClosing = false;
+    PairMovementSpeed = 200.0f;
+
+    CurrentClosingPairIndex = 0;
+    CurrentOpeningPairIndex = 0;
+    TotalPairs = NumberOfHooks / 2;
+
     CurrentOpeningHookIndex = 0;
     CurrentClosingHookIndex = 0;
-    MinHookSpacing = 50.0f;
+    bIsMovingHook = false;
 }
 
 // Called when the game starts or when spawned
@@ -63,26 +78,27 @@ void AClothMesh::BeginPlay()
     {
         InputComponent->BindAction("ResetCloth", IE_Pressed, this, &AClothMesh::ResetCloth);
         InputComponent->BindAction("GrabCloth", IE_Pressed, this, &AClothMesh::OnMouseClick);
+        // Bind curtain controls if needed
     }
+
+    // Initialize curtain targets
+    InitializeCurtainTargets();
 }
 
+// Called every frame
 void AClothMesh::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
+
+    // Lock top rows to prevent Z movement
+    LockTopRowZAxis();
 
     // Simulate the cloth and update the mesh based on particle positions
     SimulateCloth(DeltaTime);
     UpdateMesh();
 
-    // Handle curtain movements based on flags
-    if (bIsOpening)
-    {
-        HandleOpening(DeltaTime);
-    }
-    if (bIsClosing)
-    {
-        HandleClosing(DeltaTime);
-    }
+    // Update curtain movement if in progress
+    UpdateCurtainMovement(DeltaTime);
 
     // Debug: Draw spheres at each hook position to represent pinned points
     for (int32 PinnedIndex : PinnedParticles)
@@ -108,31 +124,68 @@ void AClothMesh::InitializeParticlesAndSprings()
     Springs.Empty();
     PinnedParticles.Empty();
     InitialHookPositions.Empty();
+    InitialHookPositionsCurtain.Empty();
 
     // Initialize particles above ground
     float InitialZ = 1000.0f; // 10 meters above ground (assuming 1 unit = 1 cm)
 
-    // Ensure a minimum of 3 hooks
-    int32 HooksToCreate = FMath::Max(NumberOfHooks, 3);
+    // Ensure a minimum of 2 hooks for pairing
+    int32 HooksToCreate = FMath::Max(NumberOfHooks, 2);
     int32 MidIndex = ClothWidth / 2;
 
-    // Determine indices for hooks: left end, center, right end, and additional evenly spaced hooks
+    // Determine indices for hooks: left end, right end, and additional evenly spaced hooks
     TArray<int32> HookIndices;
+
+    // Always add leftmost and rightmost hooks
     HookIndices.Add(0); // Leftmost
-    if (HooksToCreate > 2)
-    {
-        HookIndices.Add(MidIndex); // Center
-    }
     HookIndices.Add(ClothWidth - 1); // Rightmost
 
-    int32 HooksBetween = (HooksToCreate - HookIndices.Num()) / 2;
-    for (int32 i = 1; i <= HooksBetween; ++i)
-    {
-        int32 InsertIndexLeft = FMath::Clamp(MidIndex - (i * (MidIndex / (HooksBetween + 1))), 1, ClothWidth - 2);
-        HookIndices.Insert(InsertIndexLeft, HookIndices.Num() - i * 2);
+    int32 HooksToAdd = HooksToCreate - 2;
 
-        int32 InsertIndexRight = FMath::Clamp(ClothWidth - 1 - (i * (MidIndex / (HooksBetween + 1))), 1, ClothWidth - 2);
-        HookIndices.Insert(InsertIndexRight, HookIndices.Num() - i * 2);
+    // Evenly distribute the remaining hooks between left and right
+    for (int32 i = 1; i <= HooksToAdd; i++)
+    {
+        float fraction = static_cast<float>(i) / (HooksToAdd + 1);
+        int32 X = FMath::RoundToInt(fraction * (ClothWidth - 1));
+        HookIndices.Add(X);
+    }
+
+    // Ensure HookIndices has exactly NumberOfHooks elements
+    HookIndices.SetNum(NumberOfHooks);
+
+    // Remove duplicates and sort HookIndices
+    HookIndices.Sort();
+    for (int32 i = 0; i < HookIndices.Num(); ++i)
+    {
+        int32 CurrentValue = HookIndices[i];
+
+        // Loop backwards from the end of the array to the element after the current one
+        for (int32 j = HookIndices.Num() - 1; j > i; --j)
+        {
+            if (HookIndices[j] == CurrentValue)
+            {
+                // Remove duplicate found at index j
+                HookIndices.RemoveAt(j);
+            }
+        }
+    }
+
+    // Log HookIndices for debugging
+    UE_LOG(LogTemp, Warning, TEXT("HookIndices:"));
+    for (auto Hook : HookIndices)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("%d"), Hook);
+    }
+
+    // Ensure at least 2 hooks
+    if (HookIndices.Num() < 2)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Not enough hooks. Adding hooks to meet the minimum requirement."));
+        // Add hooks to meet the minimum of 2
+        if (!HookIndices.Contains(0))
+            HookIndices.Add(0);
+        if (!HookIndices.Contains(ClothWidth - 1))
+            HookIndices.Add(ClothWidth - 1);
     }
 
     // Create particles
@@ -153,6 +206,7 @@ void AClothMesh::InitializeParticlesAndSprings()
 
                 // Store the initial position for each pinned particle (hook)
                 InitialHookPositions.Add(Particle.Position);
+                InitialHookPositionsCurtain.Add(Particle.Position); // For curtain reset
             }
             else
             {
@@ -163,16 +217,18 @@ void AClothMesh::InitializeParticlesAndSprings()
         }
     }
 
-    /// Sort PinnedParticles based on their X position (left to right)
+    // Sort PinnedParticles based on their X position (left to right)
     PinnedParticles.Sort([this](const int32 A, const int32 B) -> bool {
         return Particles[A].Position.X < Particles[B].Position.X;
         });
 
     // Store the sorted initial positions
     InitialHookPositions.Empty();
+    InitialHookPositionsCurtain.Empty();
     for (int32 PinnedIndex : PinnedParticles)
     {
         InitialHookPositions.Add(Particles[PinnedIndex].Position);
+        InitialHookPositionsCurtain.Add(Particles[PinnedIndex].Position); // For curtain reset
     }
 
     // Initialize curtain target positions
@@ -185,41 +241,41 @@ void AClothMesh::InitializeParticlesAndSprings()
         {
             int32 Index = X + Y * ClothWidth;
 
-            // Structural springs
+            /// Structural springs
             if (X < ClothWidth - 1)
-                Springs.Add(FSpring(Index, Index + 1, ClothSpacing, 2.0f));
+                Springs.Add(FSpring(Index, Index + 1, ClothSpacing, 1.5f)); 
             if (Y < ClothHeight - 1)
-                Springs.Add(FSpring(Index, Index + ClothWidth, ClothSpacing, 2.0f));
+                Springs.Add(FSpring(Index, Index + ClothWidth, ClothSpacing, 1.5f)); 
 
             // Shear springs
             if (X < ClothWidth - 1 && Y < ClothHeight - 1)
             {
-                Springs.Add(FSpring(Index, Index + ClothWidth + 1, FMath::Sqrt(2) * ClothSpacing, 1.5f));
-                Springs.Add(FSpring(Index + 1, Index + ClothWidth, FMath::Sqrt(2) * ClothSpacing, 1.5f));
+                Springs.Add(FSpring(Index, Index + ClothWidth + 1, FMath::Sqrt(2) * ClothSpacing, 1.0f)); 
+                Springs.Add(FSpring(Index + 1, Index + ClothWidth, FMath::Sqrt(2) * ClothSpacing, 1.0f));
             }
 
             // Bend springs
             if (X < ClothWidth - 2)
-                Springs.Add(FSpring(Index, Index + 2, 2 * ClothSpacing, 1.2f));
+                Springs.Add(FSpring(Index, Index + 2, 2 * ClothSpacing, 0.8f));
             if (Y < ClothHeight - 2)
-                Springs.Add(FSpring(Index, Index + 2 * ClothWidth, 2 * ClothSpacing, 1.2f));
+                Springs.Add(FSpring(Index, Index + 2 * ClothWidth, 2 * ClothSpacing, 0.8f)); 
+
 
             // Additional springs for tightly woven structure if enabled
             if (ClothWidth > 3 && ClothHeight > 3)
             {
-                // Cross springs
                 if (X < ClothWidth - 2 && Y < ClothHeight - 2)
                 {
-                    Springs.Add(FSpring(Index, Index + ClothWidth + 2, FMath::Sqrt(5) * ClothSpacing, 1.5f));
-                    Springs.Add(FSpring(Index + 2, Index + ClothWidth, FMath::Sqrt(5) * ClothSpacing, 1.5f));
+                    Springs.Add(FSpring(Index, Index + ClothWidth + 2, FMath::Sqrt(5) * ClothSpacing, 1.2f)); // Adjusted
+                    Springs.Add(FSpring(Index + 2, Index + ClothWidth, FMath::Sqrt(5) * ClothSpacing, 1.2f)); // Adjusted
                 }
             }
         }
     }
 
     // Initialize movement indices and target positions
-    CurrentClosingHookIndex = 0;
-    CurrentOpeningHookIndex = 0;
+    CurrentOpeningPairIndex = 0;
+    CurrentClosingPairIndex = 0;
     TargetHookPositionsLeft.Empty();
     TargetHookPositionsRight.Empty();
 
@@ -281,13 +337,13 @@ void AClothMesh::SimulateCloth(float DeltaTime)
     for (int32 i = 0; i < Particles.Num(); i++)
     {
         if (Particles[i].bIsPinned)
-            continue;
+            continue; // Skip updating position for pinned particles
 
         FVector Temp = Particles[i].Position;
         // Calculate velocity based on current and previous positions
-        Particles[i].Velocity = (Particles[i].Position - Particles[i].PreviousPosition) * Damping;
+        Particles[i].Velocity = (Particles[i].Position - Particles[i].PreviousPosition) / DeltaTime * Damping;
         // Update position with velocity and acceleration
-        Particles[i].Position += Particles[i].Velocity + Particles[i].Acceleration * DeltaTime * DeltaTime;
+        Particles[i].Position += Particles[i].Velocity * DeltaTime + Particles[i].Acceleration * DeltaTime * DeltaTime;
 
         // Limit maximum velocity to prevent instability
         float MaxVelocity = 500.0f;
@@ -300,8 +356,17 @@ void AClothMesh::SimulateCloth(float DeltaTime)
         Particles[i].PreviousPosition = Temp;
     }
 
+    // Enforce Fixed Z Positions for Hooks More Strictly
+    for (int32 i = 0; i < PinnedParticles.Num(); i++)
+    {
+        int32 Index = PinnedParticles[i];
+        // Completely lock the position except for X and Y
+        Particles[Index].Position = FVector(Particles[Index].Position.X, Particles[Index].Position.Y, InitialHookPositions[i].Z);
+        Particles[Index].PreviousPosition = FVector(Particles[Index].PreviousPosition.X, Particles[Index].PreviousPosition.Y, InitialHookPositions[i].Z);
+    }
+
     // Resolve constraints multiple times for stability
-    for (int32 Iter = 0; Iter < 15; Iter++) // Increased iterations for better stability
+    for (int32 Iter = 0; Iter < 10; Iter++) // Increased iterations for better stability
     {
         // Resolve springs
         for (int32 s = 0; s < Springs.Num(); s++)
@@ -315,10 +380,7 @@ void AClothMesh::SimulateCloth(float DeltaTime)
             if (CurrentLength == 0.0f)
                 continue; // Prevent division by zero
 
-            // Clamp the stretch to a maximum of 1.05 times the rest length
-            float MaxStretch = 1.05f * Spring.RestLength;
-            float ClampedLength = FMath::Min(CurrentLength, MaxStretch);
-            float Difference = (ClampedLength - Spring.RestLength) / ClampedLength;
+            float Difference = (CurrentLength - Spring.RestLength) / CurrentLength;
 
             if (pA.bIsPinned && pB.bIsPinned)
                 continue;
@@ -355,19 +417,36 @@ void AClothMesh::SimulateCloth(float DeltaTime)
 void AClothMesh::HandleCollisions()
 {
     float GroundLevel = 0.0f; // Ground is at Z = 0
+    const float FrictionCoefficient = 0.8f; // Adjust as needed
+    const float Restitution = 0.3f; // Bounciness
 
     for (FParticle& Particle : Particles)
     {
+        if (Particle.bIsPinned)
+            continue; // Skip collision handling for pinned particles
+
         // Ground collision
         if (Particle.Position.Z < GroundLevel)
         {
-            Particle.Position.Z = GroundLevel;
+            // Calculate penetration depth
+            float Penetration = GroundLevel - Particle.Position.Z;
 
-            // Reflect the Z component of velocity with damping to simulate energy loss
-            Particle.Velocity.Z = -Particle.Velocity.Z * 0.5f; // 0.5f is the damping factor
+            // Correct the position based on penetration
+            Particle.Position.Z += Penetration;
+
+            // Reflect the Z component of velocity based on restitution
+            FVector Velocity = (Particle.Position - Particle.PreviousPosition) / TimeStep;
+            Velocity.Z = -Velocity.Z * Restitution;
+            Particle.PreviousPosition = Particle.Position - Velocity * TimeStep;
+
+            // Apply friction to X and Y velocities
+            FVector HorizontalVelocity = FVector(Velocity.X, Velocity.Y, 0.0f);
+            HorizontalVelocity *= FrictionCoefficient;
+            Particle.PreviousPosition.X = Particle.Position.X - HorizontalVelocity.X * TimeStep;
+            Particle.PreviousPosition.Y = Particle.Position.Y - HorizontalVelocity.Y * TimeStep;
         }
 
-        // Collision with other objects
+        // Collision with other objects (if any)
         for (AActor* CollisionActor : CollisionObjects)
         {
             if (!CollisionActor)
@@ -383,41 +462,32 @@ void AClothMesh::HandleCollisions()
 
             if (Distance < SelfCollisionRadius && Distance > 0.0f) // Using SelfCollisionRadius as a generic collision threshold
             {
-                FVector Correction = Delta.GetSafeNormal() * SelfCollisionRadius;
-                Particle.Position = ClosestPoint + Correction;
-
-                // Reflect velocity based on collision normal
                 FVector CollisionNormal = Delta.GetSafeNormal();
-                Particle.Velocity = Particle.Velocity.MirrorByVector(CollisionNormal) * 0.5f; // Damping factor
+                FVector Correction = CollisionNormal * (SelfCollisionRadius - Distance) * SelfCollisionStiffness;
+
+                // Position correction
+                if (!Particle.bIsPinned)
+                {
+                    Particle.Position += Correction;
+                    Particle.PreviousPosition += Correction;
+                }
             }
         }
     }
 }
-
 
 void AClothMesh::ApplyForces(float DeltaTime)
 {
     // Apply gravity
     FVector Gravity = FVector(0, 0, GravityStrength); // Already downward
 
-    // Apply wind with slight oscillation and random variation
-    WindTimeAccumulator += DeltaTime;
-    float Oscillation = FMath::Sin(WindTimeAccumulator * WindOscillationFrequency);
-    FVector DynamicWindDirection = WindDirection.GetSafeNormal();
-    // Slightly vary the wind direction over time
-    DynamicWindDirection = DynamicWindDirection.RotateAngleAxis(Oscillation * 5.0f, FVector(0, 0, 1));
-
-    // Introduce random variation
-    float RandomStrengthVariation = FMath::FRandRange(-10.0f, 10.0f); // Adjust range as needed
-    FVector RandomWindDirectionVariation = FVector(FMath::FRandRange(-5.0f, 5.0f), FMath::FRandRange(-5.0f, 5.0f), FMath::FRandRange(-2.0f, 2.0f));
-    RandomWindDirectionVariation = RandomWindDirectionVariation.GetClampedToMaxSize(1.0f); // Normalize
-
-    FVector Wind = (DynamicWindDirection + RandomWindDirectionVariation) * (WindStrength + RandomStrengthVariation);
+    // Apply constant wind
+    //FVector Wind = WindDirection.GetSafeNormal() * WindStrength;
 
     for (FParticle& Particle : Particles)
     {
         if (Particle.bIsPinned)
-            continue;
+            continue; // Skip applying forces to pinned particles
 
         // Reset acceleration
         Particle.Acceleration = FVector::ZeroVector;
@@ -426,7 +496,7 @@ void AClothMesh::ApplyForces(float DeltaTime)
         Particle.Acceleration += Gravity;
 
         // Apply wind
-        Particle.Acceleration += Wind;
+        //Particle.Acceleration += Wind;
     }
 }
 
@@ -441,38 +511,112 @@ int32 GetCellHash(const FVector& Position, float CellSize)
 void AClothMesh::HandleSelfCollisions()
 {
     float CellSize = SelfCollisionRadius * 2.0f;
-    TMap<int32, TArray<int32>> SpatialHash;
+    TMap<FIntVector, TArray<int32>> SpatialHashVector;
 
-    // Populate the spatial hash
+    // Populate the spatial hash with cell coordinates
     for (int32 i = 0; i < Particles.Num(); i++)
     {
-        int32 Hash = GetCellHash(Particles[i].Position, CellSize);
-        SpatialHash.FindOrAdd(Hash).Add(i);
+        FVector Pos = Particles[i].Position;
+        FIntVector Cell = FIntVector(
+            FMath::FloorToInt(Pos.X / CellSize),
+            FMath::FloorToInt(Pos.Y / CellSize),
+            FMath::FloorToInt(Pos.Z / CellSize)
+        );
+        SpatialHashVector.FindOrAdd(Cell).Add(i);
     }
 
-    // Check collisions within each cell and neighboring cells
-    for (const auto& Elem : SpatialHash)
+    // Define neighbor offsets for a 3D grid (including the cell itself)
+    TArray<FIntVector> NeighborOffsets;
+    for (int32 x = -1; x <= 1; x++)
     {
-        const TArray<int32>& CellParticles = Elem.Value;
-        for (int32 i = 0; i < CellParticles.Num(); i++)
+        for (int32 y = -1; y <= 1; y++)
         {
-            for (int32 j = i + 1; j < CellParticles.Num(); j++)
+            for (int32 z = -1; z <= 1; z++)
+            {
+                NeighborOffsets.Add(FIntVector(x, y, z));
+            }
+        }
+    }
+
+    // Iterate through each cell and its neighbors
+    for (const auto& Elem : SpatialHashVector)
+    {
+        FIntVector Cell = Elem.Key;
+        const TArray<int32>& CellParticles = Elem.Value;
+
+        for (const FIntVector& Offset : NeighborOffsets)
+        {
+            FIntVector NeighborCell = Cell + Offset;
+
+            // Check if neighbor cell exists
+            if (!SpatialHashVector.Contains(NeighborCell))
+                continue;
+
+            const TArray<int32>& NeighborParticles = SpatialHashVector[NeighborCell];
+
+            for (int32 i = 0; i < CellParticles.Num(); i++)
             {
                 int32 IndexA = CellParticles[i];
-                int32 IndexB = CellParticles[j];
                 FParticle& pA = Particles[IndexA];
-                FParticle& pB = Particles[IndexB];
 
-                FVector Delta = pB.Position - pA.Position;
-                float Distance = Delta.Size();
-
-                if (Distance < SelfCollisionRadius && Distance > 0.0f)
+                for (int32 j = 0; j < NeighborParticles.Num(); j++)
                 {
-                    FVector Correction = Delta.GetSafeNormal() * (SelfCollisionRadius - Distance) * 0.8f * SelfCollisionStiffness; // Increased stiffness
-                    if (!pA.bIsPinned)
-                        pA.Position -= Correction;
-                    if (!pB.bIsPinned)
-                        pB.Position += Correction;
+                    int32 IndexB = NeighborParticles[j];
+
+                    // Prevent duplicate checks and self-collision
+                    if (IndexA >= IndexB)
+                        continue;
+
+                    FParticle& pB = Particles[IndexB];
+
+                    FVector Delta = pB.Position - pA.Position;
+                    float Distance = Delta.Size();
+
+                    if (Distance < SelfCollisionRadius && Distance > 0.0f)
+                    {
+                        FVector CollisionNormal = Delta.GetSafeNormal();
+                        FVector RelativeVelocity = pB.Velocity - pA.Velocity;
+
+                        // Compute relative velocity components
+                        float Vn = FVector::DotProduct(RelativeVelocity, CollisionNormal);
+                        if (Vn > 0)
+                            continue; // Prevent particles moving away from each other
+
+                        FVector VnVec = Vn * CollisionNormal;
+                        FVector VtVec = RelativeVelocity - VnVec;
+
+                        // Apply friction to tangential component
+                        FVector VtDir = VtVec.GetSafeNormal();
+                        FVector FrictionForce = -VtDir * DynamicFrictionCoefficient;
+
+                        // Limit the friction force to not reverse the tangential velocity
+                        if (FVector::DotProduct(FrictionForce, VtVec) > 0.0f)
+                        {
+                            FrictionForce = -VtVec;
+                        }
+
+                        // Apply friction to velocities
+                        pA.Velocity += FrictionForce * TimeStep;
+                        pB.Velocity -= FrictionForce * TimeStep;
+
+                        // Position correction to prevent overlap
+                        FVector Correction = CollisionNormal * (SelfCollisionRadius - Distance) * 0.5f * SelfCollisionStiffness;
+
+                        if (!pA.bIsPinned && !pB.bIsPinned)
+                        {
+                            pA.Position -= Correction;
+                            pB.Position += Correction;
+                        }
+                        else if (pA.bIsPinned && !pB.bIsPinned)
+                        {
+                            pB.Position += Correction * 2.0f; // Apply more correction to unpinned
+                        }
+                        else if (!pA.bIsPinned && pB.bIsPinned)
+                        {
+                            pA.Position -= Correction * 2.0f; // Apply more correction to unpinned
+                        }
+                        // If both are pinned, no correction is applied
+                    }
                 }
             }
         }
@@ -537,8 +681,8 @@ void AClothMesh::UpdateMesh()
 void AClothMesh::ResetCloth()
 {
     InitializeParticlesAndSprings();
-    CurrentClosingHookIndex = PinnedParticles.Num() - 1;
-    CurrentOpeningHookIndex = 0;
+    CurrentOpeningPairIndex = 0;
+    CurrentClosingPairIndex = 0;
     TargetHookPositionsLeft.Empty();
     TargetHookPositionsRight.Empty();
     bMovingLeft = false;
@@ -688,129 +832,290 @@ void AClothMesh::HandleTearing()
     }
 }
 
-void AClothMesh::HandleClosing(float DeltaTime)
+// Curtain Control Functions
+void AClothMesh::StartOpening()
 {
-    if (CurrentClosingHookIndex < 0)
+    if (bIsOpening || bIsClosing)
+        return; // Prevent overlapping actions
+
+    if (PinnedParticles.Num() < 2)
     {
-        bIsClosing = false;
+        UE_LOG(LogTemp, Warning, TEXT("Not enough hooks to open the curtain."));
         return;
     }
-
-    for (int32 Offset = 0; Offset < 2; Offset++) // Move two hooks at a time
-    {
-        if (CurrentClosingHookIndex < 0)
-            break;
-
-        int32 PinnedIndex = PinnedParticles[CurrentClosingHookIndex];
-        FVector CurrentPos = Particles[PinnedIndex].Position;
-        FVector TargetPos = TargetHookPositionsClose[CurrentClosingHookIndex];
-
-        // Allow only X-axis movement for closing, lock Y and Z positions to initial values
-        TargetPos.Y = InitialHookPositions[CurrentClosingHookIndex].Y;
-        TargetPos.Z = InitialHookPositions[CurrentClosingHookIndex].Z;
-
-        FVector Direction = (TargetPos - CurrentPos).GetSafeNormal();
-        float Distance = FVector::Dist(CurrentPos, TargetPos);
-        float MoveStep = HookMovementSpeed * DeltaTime;
-
-        if (Distance <= MoveStep)
-        {
-            Particles[PinnedIndex].Position = TargetPos;
-            Particles[PinnedIndex].PreviousPosition = TargetPos;
-            CurrentClosingHookIndex--;
-        }
-        else
-        {
-            FVector NewPos = CurrentPos + Direction * MoveStep;
-            NewPos.Y = InitialHookPositions[CurrentClosingHookIndex].Y;  // Lock Y
-            NewPos.Z = InitialHookPositions[CurrentClosingHookIndex].Z;  // Lock Z
-            Particles[PinnedIndex].Position = NewPos;
-            Particles[PinnedIndex].PreviousPosition = NewPos;
-        }
-    }
-}
-
-void AClothMesh::HandleOpening(float DeltaTime)
-{
-    if (CurrentOpeningHookIndex >= PinnedParticles.Num())
-    {
-        bIsOpening = false;
-        return;
-    }
-
-    for (int32 Offset = 0; Offset < 2; Offset++) // Move two hooks at a time
-    {
-        if (CurrentOpeningHookIndex >= PinnedParticles.Num())
-            break;
-
-        int32 PinnedIndex = PinnedParticles[CurrentOpeningHookIndex];
-        FVector CurrentPos = Particles[PinnedIndex].Position;
-        FVector TargetPos = TargetHookPositionsOpen[CurrentOpeningHookIndex];
-
-        // Allow only X-axis movement for opening, lock Y and Z positions to initial values
-        TargetPos.Y = InitialHookPositions[CurrentOpeningHookIndex].Y;
-        TargetPos.Z = InitialHookPositions[CurrentOpeningHookIndex].Z;
-
-        FVector Direction = (TargetPos - CurrentPos).GetSafeNormal();
-        float Distance = FVector::Dist(CurrentPos, TargetPos);
-        float MoveStep = HookMovementSpeed * DeltaTime;
-
-        if (Distance <= MoveStep)
-        {
-            Particles[PinnedIndex].Position = TargetPos;
-            Particles[PinnedIndex].PreviousPosition = TargetPos;
-            CurrentOpeningHookIndex++;
-        }
-        else
-        {
-            FVector NewPos = CurrentPos + Direction * MoveStep;
-            NewPos.Y = InitialHookPositions[CurrentOpeningHookIndex].Y;  // Lock Y
-            NewPos.Z = InitialHookPositions[CurrentOpeningHookIndex].Z;  // Lock Z
-            Particles[PinnedIndex].Position = NewPos;
-            Particles[PinnedIndex].PreviousPosition = NewPos;
-        }
-    }
-}
-
-void AClothMesh::OpenCurtain()
-{
-    if (bIsOpening || bIsClosing || PinnedParticles.Num() == 0)
-        return;
 
     bIsOpening = true;
-    CurrentOpeningHookIndex = 0; // Start from the leftmost hook
+    CurrentOpeningHookIndex = PinnedParticles.Num() - 1; // Start with the rightmost hook
+    bIsMovingHook = false; // Ready to move the first hook
 }
 
-void AClothMesh::CloseCurtain()
+void AClothMesh::StartClosing()
 {
-    if (bIsClosing || bIsOpening || PinnedParticles.Num() == 0)
+    if (bIsOpening || bIsClosing)
+        return; // Prevent overlapping actions
+
+    if (PinnedParticles.Num() < 2)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Not enough hooks to close the curtain."));
         return;
+    }
 
     bIsClosing = true;
-    CurrentClosingHookIndex = PinnedParticles.Num() - 1; // Start from the rightmost hook
+    CurrentClosingHookIndex = PinnedParticles.Num() - 1; // Start with the rightmost hook
+    bIsMovingHook = false; // Ready to move the first hook
+}
+
+void AClothMesh::SetCurtainTargetOffsets(FVector LeftOffset, FVector RightOffset)
+{
+    // Ensure no Z-axis offset is applied
+    LeftOffset.Z = 0.0f;
+    RightOffset.Z = 0.0f;
+
+    CurtainLeftOffset = LeftOffset;
+    CurtainRightOffset = RightOffset;
+
+    // Update target positions based on offsets
+    TargetHookPositionsLeft.Empty();
+    TargetHookPositionsRight.Empty();
+
+    for (int32 i = 0; i < TotalPairs; i++)
+    {
+        // Left hooks
+        FVector OriginalPosLeft = InitialHookPositionsCurtain[i];
+        FVector TargetPosLeft = OriginalPosLeft + CurtainLeftOffset;
+        // Ensure Z remains unchanged
+        TargetPosLeft.Z = OriginalPosLeft.Z;
+        TargetHookPositionsLeft.Add(TargetPosLeft);
+
+        // Right hooks
+        if (i + TotalPairs < InitialHookPositionsCurtain.Num())
+        {
+            FVector OriginalPosRight = InitialHookPositionsCurtain[i + TotalPairs];
+            FVector TargetPosRight = OriginalPosRight + CurtainRightOffset;
+            // Ensure Z remains unchanged
+            TargetPosRight.Z = OriginalPosRight.Z;
+            TargetHookPositionsRight.Add(TargetPosRight);
+        }
+    }
+}
+
+void AClothMesh::ResetCurtain()
+{
+    // Reset to initial positions
+    for (int32 i = 0; i < PinnedParticles.Num(); i++)
+    {
+        Particles[PinnedParticles[i]].Position = InitialHookPositionsCurtain[i];
+        Particles[PinnedParticles[i]].PreviousPosition = InitialHookPositionsCurtain[i];
+    }
+
+    // Update mesh immediately
+    UpdateMesh();
+
+    // Clear movement flags
+    bIsOpening = false;
+    bIsClosing = false;
+    bIsMovingHook = false;
+    CurrentOpeningHookIndex = 0;
+    CurrentClosingHookIndex = 0;
 }
 
 void AClothMesh::InitializeCurtainTargets()
 {
-    TargetHookPositionsOpen.Empty();
-    TargetHookPositionsClose.Empty();
+    FVector DefaultLeftOffset = FVector(-500.0f, 0.0f, 0.0f);
+    FVector DefaultRightOffset = FVector(500.0f, 0.0f, 0.0f);
 
-    float CloseDistance = 200.0f;  // Adjust to control how close hooks come when closed
-    float ZOffsetBump = 30.0f;     // Small Z-axis bump for realistic folding
-    float YForwardFold = 20.0f;    // Slight depth offset
+    SetCurtainTargetOffsets(DefaultLeftOffset, DefaultRightOffset);
+}
 
-    // Calculate the leftmost position for all hooks when closing
-    FVector LeftmostPosition = InitialHookPositions[0] - FVector(CloseDistance, YForwardFold, ZOffsetBump);
-
-    for (int32 i = 0; i < PinnedParticles.Num(); i++)
+void AClothMesh::UpdateCurtainMovement(float DeltaTime)
+{
+    if (bIsOpening)
     {
-        FVector InitialPos = InitialHookPositions[i];
+        MoveNextOpeningHook(DeltaTime);
+    }
 
-        // Target positions when closing, all moving towards the leftmost side
-        FVector TargetPosClose = LeftmostPosition + FVector(0, 0, ZOffsetBump); // Add slight Z bump for realism
-        TargetHookPositionsClose.Add(TargetPosClose);
+    if (bIsClosing)
+    {
+        MoveNextClosingHook(DeltaTime);
+    }
+}
 
-        // Target positions when opening, go back to the initial positions
-        TargetHookPositionsOpen.Add(InitialPos);
+void AClothMesh::MoveNextOpeningHook(float DeltaTime)
+{
+    if (CurrentOpeningHookIndex < 0)
+    {
+        bIsOpening = false; // All hooks have been moved
+        return;
+    }
+
+    if (!bIsMovingHook)
+    {
+        bIsMovingHook = true; // Start moving the current hook
+    }
+
+    // Define target position: Move closer to the previous hook
+    FVector CurrentHookInitialPos = InitialHookPositionsCurtain[CurrentOpeningHookIndex];
+    FVector PreviousHookPos = (CurrentOpeningHookIndex > 0) ? Particles[PinnedParticles[CurrentOpeningHookIndex - 1]].Position : CurrentHookInitialPos;
+    float AdjustableDistance = 50.0f; // Adjustable distance between hooks
+
+    FVector TargetPos = PreviousHookPos + (CurrentHookInitialPos - PreviousHookPos).GetSafeNormal() * AdjustableDistance;
+
+    // Ensure Z remains unchanged
+    TargetPos.Z = CurrentHookInitialPos.Z;
+
+    // Move the current hook towards the target position
+    Particles[PinnedParticles[CurrentOpeningHookIndex]].Position = FMath::VInterpConstantTo(
+        Particles[PinnedParticles[CurrentOpeningHookIndex]].Position,
+        TargetPos,
+        DeltaTime,
+        PairMovementSpeed
+    );
+
+    // Check if the hook has reached the target position
+    float DistanceToTarget = FVector::Dist(Particles[PinnedParticles[CurrentOpeningHookIndex]].Position, TargetPos);
+    if (DistanceToTarget < 1.0f) // Threshold can be adjusted
+    {
+        // Hook has reached the target
+        bIsMovingHook = false;
+        CurrentOpeningHookIndex--; // Move to the next hook in the next tick
+    }
+}
+
+void AClothMesh::MoveNextClosingHook(float DeltaTime)
+{
+    if (CurrentClosingHookIndex < 0)
+    {
+        bIsClosing = false; // All hooks have been moved back
+        return;
+    }
+
+    if (!bIsMovingHook)
+    {
+        bIsMovingHook = true; // Start moving the current hook
+    }
+
+    // Define target position: Move back to the initial position
+    FVector TargetPos = InitialHookPositionsCurtain[CurrentClosingHookIndex];
+
+    // Move the current hook towards the target position
+    Particles[PinnedParticles[CurrentClosingHookIndex]].Position = FMath::VInterpConstantTo(
+        Particles[PinnedParticles[CurrentClosingHookIndex]].Position,
+        TargetPos,
+        DeltaTime,
+        PairMovementSpeed
+    );
+
+    // Check if the hook has reached the target position
+    float DistanceToTarget = FVector::Dist(Particles[PinnedParticles[CurrentClosingHookIndex]].Position, TargetPos);
+    if (DistanceToTarget < 1.0f) // Threshold can be adjusted
+    {
+        // Hook has reached the target
+        bIsMovingHook = false;
+        CurrentClosingHookIndex--; // Move to the next hook in the next tick
+    }
+}
+
+
+void AClothMesh::InterpolateHookPositions(float DeltaTime, const TArray<FVector>& TargetPositions, bool bIsOpeningFlag)
+{
+    if (bIsOpeningFlag)
+    {
+        for (int32 i = 0; i < TargetPositions.Num(); i++)
+        {
+            if (CurrentOpeningPairIndex >= TotalPairs)
+                break;
+
+            int32 LeftHookPairIndex = CurrentOpeningPairIndex;
+            int32 RightHookPairIndex = PinnedParticles.Num() - 1 - CurrentOpeningPairIndex;
+
+            // Safety checks
+            if (LeftHookPairIndex >= InitialHookPositionsCurtain.Num() || RightHookPairIndex >= InitialHookPositionsCurtain.Num())
+            {
+                UE_LOG(LogTemp, Error, TEXT("HookPairIndex out of bounds!"));
+                continue;
+            }
+
+            if (i < TargetPositions.Num())
+            {
+                FVector InterpolatedTargetPosLeft = TargetPositions[i];
+                FVector InterpolatedTargetPosRight = TargetPositions[i];
+
+                // Enforce Z-axis lock
+                InterpolatedTargetPosLeft.Z = InitialHookPositionsCurtain[LeftHookPairIndex].Z;
+                InterpolatedTargetPosRight.Z = InitialHookPositionsCurtain[RightHookPairIndex].Z;
+
+                // Left hook interpolation
+                Particles[PinnedParticles[LeftHookPairIndex]].Position =
+                    FMath::VInterpConstantTo(Particles[PinnedParticles[LeftHookPairIndex]].Position, InterpolatedTargetPosLeft, DeltaTime, PairMovementSpeed);
+
+                // Right hook interpolation
+                Particles[PinnedParticles[RightHookPairIndex]].Position =
+                    FMath::VInterpConstantTo(Particles[PinnedParticles[RightHookPairIndex]].Position, InterpolatedTargetPosRight, DeltaTime, PairMovementSpeed);
+            }
+        }
+
+        CurrentOpeningPairIndex++;
+        if (CurrentOpeningPairIndex >= TargetHookPositionsLeft.Num())
+        {
+            bIsOpening = false;
+        }
+    }
+    else
+    {
+        for (int32 i = 0; i < TargetPositions.Num(); i++)
+        {
+            if (CurrentClosingPairIndex >= TotalPairs)
+                break;
+
+            int32 LeftHookPairIndex = CurrentClosingPairIndex;
+            int32 RightHookPairIndex = PinnedParticles.Num() - 1 - CurrentClosingPairIndex;
+
+            // Safety checks
+            if (LeftHookPairIndex >= InitialHookPositionsCurtain.Num() || RightHookPairIndex >= InitialHookPositionsCurtain.Num())
+            {
+                UE_LOG(LogTemp, Error, TEXT("HookPairIndex out of bounds!"));
+                continue;
+            }
+
+            if (i < TargetPositions.Num())
+            {
+                FVector InterpolatedTargetPosLeft = TargetPositions[i];
+                FVector InterpolatedTargetPosRight = TargetPositions[i];
+
+                // Enforce Z-axis lock
+                InterpolatedTargetPosLeft.Z = InitialHookPositionsCurtain[LeftHookPairIndex].Z;
+                InterpolatedTargetPosRight.Z = InitialHookPositionsCurtain[RightHookPairIndex].Z;
+
+                // Left hook interpolation
+                Particles[PinnedParticles[LeftHookPairIndex]].Position =
+                    FMath::VInterpConstantTo(Particles[PinnedParticles[LeftHookPairIndex]].Position, InterpolatedTargetPosLeft, DeltaTime, PairMovementSpeed);
+
+                // Right hook interpolation
+                Particles[PinnedParticles[RightHookPairIndex]].Position =
+                    FMath::VInterpConstantTo(Particles[PinnedParticles[RightHookPairIndex]].Position, InterpolatedTargetPosRight, DeltaTime, PairMovementSpeed);
+            }
+        }
+
+        CurrentClosingPairIndex++;
+        if (CurrentClosingPairIndex >= TargetPositions.Num())
+        {
+            bIsClosing = false;
+        }
+    }
+}
+
+void AClothMesh::LockTopRowZAxis()
+{
+    int32 RowsToLock = FMath::Clamp(FMath::CeilToInt(20.0f / ClothSpacing), 1, ClothHeight);
+
+    for (int32 Y = 0; Y < RowsToLock; Y++)
+    {
+        for (int32 X = 0; X < ClothWidth; X++)
+        {
+            int32 Index = Y * ClothWidth + X;
+            float InitialZ = Particles[Index].Position.Z;
+            Particles[Index].Position.Z = InitialZ;
+            Particles[Index].PreviousPosition.Z = InitialZ;
+        }
     }
 }

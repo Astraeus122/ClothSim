@@ -84,6 +84,7 @@ public:
     // Called every frame
     virtual void Tick(float DeltaTime) override;
 
+    // Cloth Control Functions
     UFUNCTION(BlueprintCallable, Category = "Cloth")
     void ResetCloth();
 
@@ -116,15 +117,42 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Cloth|Tearing")
     void EnableTearing(bool bEnable);
 
+    // Curtain Control Functions
+    /**
+     * Starts the process of opening the curtain by pulling it to the side.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Curtain")
+    void StartOpening();
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Settings", meta = (AllowPrivateAccess = "true"))
-    float WindOscillationFrequency = 0.5f; // Frequency of direction change
+    /**
+     * Starts the process of closing the curtain by pulling it back into place.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Curtain")
+    void StartClosing();
 
-    UFUNCTION(BlueprintCallable, Category = "Cloth")
-    void OpenCurtain();
+    /**
+     * Sets the target positions for hooks when the curtain is fully opened.
+     * @param LeftOffset The offset to apply to the left hooks.
+     * @param RightOffset The offset to apply to the right hooks.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Curtain")
+    void SetCurtainTargetOffsets(FVector LeftOffset, FVector RightOffset);
 
-    UFUNCTION(BlueprintCallable, Category = "Cloth")
-    void CloseCurtain();
+    /**
+     * Resets the curtain to its initial state.
+     */
+    UFUNCTION(BlueprintCallable, Category = "Curtain")
+    void ResetCurtain();
+
+    // Minimum velocity threshold to simulate static friction
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cloth Physics")
+    float StaticFrictionThreshold = 50.0f;
+
+    // Friction coefficients
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cloth Physics")
+    float StaticFrictionCoefficient = 0.5f; 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cloth Physics")
+    float DynamicFrictionCoefficient = 0.3f;
 
 private:
     // Procedural Mesh Component to render the cloth
@@ -231,12 +259,7 @@ private:
     UPROPERTY()
     TArray<AActor*> CollisionObjects;
 
-    // Target positions for hooks when moving left
-    TArray<FVector> TargetHookPositionsLeft;
-
-    // Target positions for hooks when moving right
-    TArray<FVector> TargetHookPositionsRight;
-
+    // Curtain Control Variables
     // Flags to control hook movement
     bool bMovingLeft;
     bool bMovingRight;
@@ -250,27 +273,57 @@ private:
 
     // Movement speed per pair
     float PairMovementSpeed;
-    
+
     // Minimum spacing between hooks to prevent overlapping
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Hook Settings", meta = (AllowPrivateAccess = "true"))
     float MinHookSpacing;
 
-    // Flags to control curtain movement
+    // Target offsets for curtain movement
+    FVector CurtainLeftOffset;
+    FVector CurtainRightOffset;
+
+    // Initial positions of hooks for curtain movement reset
+    TArray<FVector> InitialHookPositionsCurtain;
+
+    // Target positions for hooks when moving left (opening)
+    TArray<FVector> TargetHookPositionsLeft;
+
+    // Target positions for hooks when moving right (opening)
+    TArray<FVector> TargetHookPositionsRight;
+
+    // Target positions for closing movement (pushing outward)
+    TArray<FVector> TargetHookPositionsClosing;
+
+    // Function to update curtain movement each tick
+    void UpdateCurtainMovement(float DeltaTime);
+
+    // Function to initialize curtain target positions
+    void InitializeCurtainTargets();
+
+    // Function to interpolate hook positions towards target positions
+    void InterpolateHookPositions(float DeltaTime, const TArray<FVector>& TargetPositions, bool bIsClosing);
+
+    void ResolveSprings();
+
+    void ApplySpringCorrection(int32 ParticleIndex, const FVector& Correction);
+
+    void ApplyCollisionCorrection(int32 ParticleIndex, const FVector& Correction);
+
+    bool IsTopRowParticle(int32 Index);
+
+    void MoveNextOpeningHook(float DeltaTime);
+    void MoveNextClosingHook(float DeltaTime);
+
+    void LockTopRowZAxis();
+
+    // State flags for curtain movement
     bool bIsOpening;
     bool bIsClosing;
 
-    // Indices to track the current hook being moved
+    // Current hook index being moved during opening/closing
     int32 CurrentOpeningHookIndex;
     int32 CurrentClosingHookIndex;
 
-    // Target positions for hooks
-    TArray<FVector> TargetHookPositionsOpen;
-    TArray<FVector> TargetHookPositionsClose;
-
-    // Function to set up target positions for opening and closing
-    void InitializeCurtainTargets();
-
-    // Functions to handle the movement per frame
-    void HandleOpening(float DeltaTime);
-    void HandleClosing(float DeltaTime);
+    // Flags to indicate if a hook is currently being moved
+    bool bIsMovingHook;
 };
