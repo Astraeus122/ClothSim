@@ -479,14 +479,14 @@ void AClothMesh::HandleCollisions()
 void AClothMesh::ApplyForces(float DeltaTime)
 {
     // Apply gravity
-    FVector Gravity = FVector(0, 0, GravityStrength); // Already downward
+    FVector Gravity = FVector(0, 0, GravityStrength); 
 
     // Apply constant wind
-    //FVector Wind = WindDirection.GetSafeNormal() * WindStrength;
+    FVector Wind = WindDirection.GetSafeNormal() * WindStrength;
 
     for (FParticle& Particle : Particles)
     {
-        if (Particle.bIsPinned)
+        if (Particle.bIsPinned) 
             continue; // Skip applying forces to pinned particles
 
         // Reset acceleration
@@ -496,7 +496,7 @@ void AClothMesh::ApplyForces(float DeltaTime)
         Particle.Acceleration += Gravity;
 
         // Apply wind
-        //Particle.Acceleration += Wind;
+        Particle.Acceleration += Wind;
     }
 }
 
